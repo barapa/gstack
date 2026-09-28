@@ -1,12 +1,63 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { generateAutoplanSnapshotTool } from '../scripts/resolvers/composition';
 import { HOST_PATHS, type TemplateContext } from '../scripts/resolvers/types';
 import { runBashScript } from './helpers/bash-script';
+
+
+// Keep setup diagnostics in regular files to avoid blocked pipe collection.
+// Preserve refusal text and the original child verdict.
+function spawnSetup(args: readonly string[], options: SpawnSyncOptionsWithStringEncoding, executable = 'bash'): SpawnSyncReturns<string> {
+  const capture = mkdtempSync(join(tmpdir(), 'gstack-setup-output-'));
+  const stdoutFile = join(capture, 'stdout'), stderrFile = join(capture, 'stderr');
+  let stdoutFd: number | undefined, stderrFd: number | undefined;
+  try {
+    stdoutFd = openSync(stdoutFile, 'w', 0o600);
+    stderrFd = openSync(stderrFile, 'w', 0o600);
+    const result = spawnSync(executable, args, { ...options, stdio: ['pipe', stdoutFd, stderrFd] });
+    if (result.error && !result.pid) return result;
+    const stdout = readFileSync(stdoutFile, options.encoding), stderr = readFileSync(stderrFile, options.encoding);
+    return { ...result, stdout, stderr, output: [result.output[0], stdout, stderr] };
+  } finally {
+    if (stdoutFd !== undefined) closeSync(stdoutFd);
+    if (stderrFd !== undefined) closeSync(stderrFd);
+    rmSync(capture, { recursive: true, force: true });
+  }
+}
+
+test('setup file capture preserves complete output, exit and signal semantics', () => {
+  const options = { encoding: 'utf8' as const, timeout: 60_000 };
+  const stdout = 'out'.repeat(2_048), stderr = 'err'.repeat(2_048);
+  const captured = spawnSetup(['-c', 'printf %s "$FIXTURE_STDOUT"; printf %s "$FIXTURE_STDERR" >&2; exit 7'], { ...options, env: { ...process.env, FIXTURE_STDOUT: stdout, FIXTURE_STDERR: stderr } });
+  expect(captured.status).toBe(7);
+  expect(captured.signal).toBeNull();
+  expect(captured.error).toBeUndefined();
+  expect(captured.stdout).toBe(stdout);
+  expect(captured.stderr).toBe(stderr);
+  expect(captured.output).toEqual([null, stdout, stderr]);
+  const signalled = spawnSetup(['-c', 'kill -TERM $$'], options);
+  const expected = spawnSync('bash', ['-c', 'kill -TERM $$'], options);
+  expect(signalled.status).toBe(expected.status);
+  expect(signalled.signal).toBe(expected.signal);
+  expect(signalled.stdout).toBe(expected.stdout);
+  expect(signalled.stderr).toBe(expected.stderr);
+  const missingDirectory = mkdtempSync(join(tmpdir(), 'gstack-missing-shell-'));
+  owned.push(missingDirectory);
+  const missingExecutable = join(missingDirectory, 'not-installed-bash');
+  const missing = spawnSetup(['-c', 'exit 0'], options, missingExecutable);
+  const expectedMissing = spawnSync(missingExecutable, ['-c', 'exit 0'], options);
+  expect(expectedMissing.error?.code).toBe('ENOENT');
+  expect(missing.error?.code).toBe(expectedMissing.error?.code);
+  expect(missing.status).toBe(expectedMissing.status);
+  expect(missing.signal).toBe(expectedMissing.signal);
+  expect(missing.stdout).toBe(expectedMissing.stdout);
+  expect(missing.stderr).toBe(expectedMissing.stderr);
+  expect(missing.output).toEqual(expectedMissing.output);
+});
 
 const ROOT = resolve(import.meta.dir, '..');
 const files = spawnSync('git', ['ls-files', '-z'], { cwd: ROOT, encoding: 'utf8', timeout: 10_000 });
@@ -125,7 +176,7 @@ exec ${quote(realRm)} "$@"
 }
 
 function install(f: ReturnType<typeof fixture>, args = '--host codex') {
-  const result = spawnSync('bash', [join(f.source, 'setup'), ...args.split(' '), '--no-plan-tune-hooks', '--no-timeline-stop-hook', '--no-team'], {
+  const result = spawnSetup([join(f.source, 'setup'), ...args.split(' '), '--no-plan-tune-hooks', '--no-timeline-stop-hook', '--no-team'], {
     cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
   });
   expect(result.status, result.stdout + result.stderr).toBe(0);
@@ -326,7 +377,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
     symlinkSync(join(f.project, '.claude/skills'), join(f.project, '.agents/skills'), 'dir');
     expect(realpathSync(join(f.project, '.agents/skills/gstack'))).toBe(f.source);
     fixtureWriteFileSync(join(f.source, 'uncommitted-work'), 'Keep the running source.\n');
-    const result = spawnSync('bash', [join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+    const result = spawnSetup([join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
       cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
     });
     expect(existsSync(join(f.source, 'uncommitted-work')), result.stdout + result.stderr).toBe(true);
@@ -349,7 +400,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
     for (const host of ['codex', 'auto']) for (let run = 0; run < 2; run++) {
       const args = [join(f.source, 'setup'), '--host', host, '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'];
       if (global) args.push('--global');
-      const result = spawnSync('bash', args, { cwd: f.other, env, encoding: 'utf8', timeout: 60_000 });
+      const result = spawnSetup(args, { cwd: f.other, env, encoding: 'utf8', timeout: 60_000 });
       expect(tree(f.dir)).toEqual(before);
       expect(result.status, result.stdout + result.stderr).toBe(1);
       expect(result.stderr).toContain('runtime directory contains the source checkout');
@@ -363,7 +414,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
     cpSync(f.source, sibling, { recursive: true, verbatimSymlinks: true });
     fixtureWriteFileSync(join(sibling, 'uncommitted-work'), 'Keep sibling checkout edits.\n');
     const before = tree(f.dir);
-    const result = spawnSync('bash', [join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+    const result = spawnSetup([join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
       cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
     });
     expect(tree(f.dir)).toEqual(before);
@@ -376,7 +427,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
     fixtureMkdirSync(join(f.project, '.agents'));
     symlinkSync(f.global, join(f.project, '.agents/skills'), 'dir');
     const before = tree(f.dir);
-    const result = spawnSync('bash', [join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+    const result = spawnSetup([join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
       cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
     });
     expect(tree(f.dir)).toEqual(before);
@@ -415,7 +466,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
     fixtureWriteFileSync(join(f.home, '.gstack/.last-setup-version'), marker === 'current' ? readFileSync(join(f.source, 'VERSION')) : marker);
     const before = tree(f.dir);
     for (let run = 0; run < 2; run++) {
-      const result = spawnSync('bash', [join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+      const result = spawnSetup([join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
         cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
       });
       expect(result.status, result.stdout + result.stderr).toBe(1);
@@ -464,7 +515,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
     symlinkSync(target === 'source' ? f.source : renderedSkills, join(f.project, '.agents/skills'), 'dir');
     if (windows) fixtureWriteFileSync(join(f.dir, 'commands/uname'), '#!/bin/sh\nprintf "MINGW64_NT-10.0\\n"\n', { mode: 0o755 });
     const before = tree(f.dir);
-    const result = spawnSync('bash', [join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+    const result = spawnSetup([join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
       cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
     });
     expect(result.status, result.stdout + result.stderr).toBe(1);
@@ -494,7 +545,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
     fixtureWriteFileSync(join(f.home, '.gstack/.last-setup-version'), '1.85.0.0');
     const before = tree(f.dir);
     for (const host of ['codex', 'claude', 'auto']) for (let run = 0; run < 2; run++) {
-      const result = spawnSync('bash', [join(f.source, 'setup'), '--host', host, '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+      const result = spawnSetup([join(f.source, 'setup'), '--host', host, '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
         cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
       });
       expect(tree(f.dir)).toEqual(before);
@@ -513,7 +564,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
     else symlinkSync(target === 'source-root' ? f.source : target.startsWith('cyclic') ? component : join(f.source, 'missing-generation'), component, 'dir');
     const before = tree(f.dir);
     for (let run = 0; run < 2; run++) {
-      const result = spawnSync('bash', [join(f.source, 'setup'), '--host', 'codex', '--no-team'], {
+      const result = spawnSetup([join(f.source, 'setup'), '--host', 'codex', '--no-team'], {
         cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
       });
       expect(tree(f.dir)).toEqual(before);
@@ -591,7 +642,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
       else symlinkSync(target === 'cyclic-skills' ? 'skills' : join(f.dir, 'missing-skills'), local, 'dir');
     }
     const before = tree(f.dir);
-    const result = spawnSync('bash', [join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+    const result = spawnSetup([join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
       cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
     });
     expect(result.status, result.stdout + result.stderr).toBe(1);
@@ -648,7 +699,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
       }
       const env = global ? { ...f.env, CODEX_HOME: join(f.project, '.agents') } : f.env;
       const before = tree(f.dir);
-      const result = spawnSync('bash', [join(f.source, 'setup'), '--host', 'codex', ...(global ? ['--global'] : []), '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+      const result = spawnSetup([join(f.source, 'setup'), '--host', 'codex', ...(global ? ['--global'] : []), '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
         cwd: f.other, env, encoding: 'utf8', timeout: 60_000,
       });
       if (windows) {
@@ -675,7 +726,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
     symlinkSync(destination, alias, 'dir');
     if (target === 'root-sidecar') fixtureWriteFileSync(join(f.dir, 'commands/uname'), '#!/bin/sh\nprintf "MINGW64_NT-10.0\\n"\n', { mode: 0o755 });
     const before = tree(f.dir);
-    const result = spawnSync('bash', [join(f.source, 'setup'), '--host', host, '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+    const result = spawnSetup([join(f.source, 'setup'), '--host', host, '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
       cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
     });
     expect(result.status, result.stdout + result.stderr).toBe(1);
@@ -700,7 +751,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
       }
       if (windows) fixtureWriteFileSync(join(f.dir, 'commands/uname'), '#!/bin/sh\nprintf "MINGW64_NT-10.0\\n"\n', { mode: 0o755 });
       const before = tree(f.dir);
-      const result = spawnSync('bash', [join(direct, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+      const result = spawnSetup([join(direct, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
         cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
       });
       expect(result.status, result.stdout + result.stderr).toBe(1);
@@ -716,7 +767,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
     fixtureWriteFileSync(skill, '<!-- AUTO-GENERATED from SKILL.md.tmpl — do not edit directly -->\n<!-- Regenerate: bun run gen:skill-docs -->\nPreserve source content.\n');
     const env = { ...f.env, CODEX_HOME: f.source };
     const before = tree(f.dir);
-    const result = spawnSync('bash', [join(f.source, 'setup'), '--host', 'claude', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+    const result = spawnSetup([join(f.source, 'setup'), '--host', 'claude', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
       cwd: f.other, env, encoding: 'utf8', timeout: 60_000,
     });
     expect(result.status, result.stdout + result.stderr).toBe(1);
@@ -750,7 +801,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
       fixtureWriteFileSync(join(runtime, 'user-notes'), 'Keep these notes.\n');
       if (windows) fixtureWriteFileSync(join(f.dir, 'commands/uname'), '#!/bin/sh\nprintf "MINGW64_NT-10.0\\n"\n', { mode: 0o755 });
       const before = tree(f.dir);
-      const result = spawnSync('bash', [join(f.source, 'setup'), '--host', 'codex', ...(explicit ? ['--global'] : []), '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+      const result = spawnSetup([join(f.source, 'setup'), '--host', 'codex', ...(explicit ? ['--global'] : []), '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
         cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
       });
       expect(result.status, result.stdout + result.stderr).toBe(1);
@@ -782,7 +833,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
     fixtureWriteFileSync(join(runtime, 'SKILL.md'), 'A handwritten root skill.\n');
     fixtureWriteFileSync(join(runtime, 'user-notes'), 'Keep these notes.\n');
     const before = tree(runtime);
-    const result = spawnSync('bash', [join(f.source, 'setup'), '--host', 'claude', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+    const result = spawnSetup([join(f.source, 'setup'), '--host', 'claude', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
       cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
     });
     expect(result.status, result.stdout + result.stderr).toBe(0);
@@ -801,7 +852,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
       fixtureMkdirSync(asset);
     }
     const before = tree(f.dir);
-    const result = spawnSync('bash', [join(source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+    const result = spawnSetup([join(source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
       cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
     });
     expect(result.status, result.stdout + result.stderr).toBe(1);
@@ -826,7 +877,7 @@ describe.skipIf(process.platform === 'win32')('setup Codex destination follows r
       symlinkSync(prior, join(generated, 'agents'), 'dir');
     }
     const before = tree(f.dir);
-    const result = spawnSync('bash', [join(direct, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+    const result = spawnSetup([join(direct, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
       cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
     });
     expect(result.status, result.stdout + result.stderr).toBe(1);
@@ -910,7 +961,7 @@ describe.skipIf(process.platform === 'win32')('F13 independent review boundaries
       }
       const before = tree(f.dir);
       for (let run = 0; run < 2; run++) {
-        const result = spawnSync('bash', [join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+        const result = spawnSetup([join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
           cwd: f.other, env: { ...f.env, CODEX_HOME: codexHome }, encoding: 'utf8', timeout: 60_000,
         });
         expect(result.status, result.stdout + result.stderr).toBe(1);
@@ -929,7 +980,7 @@ describe.skipIf(process.platform === 'win32')('F13 independent review boundaries
       symlinkSync(link, link);
       const before = tree(f.dir);
       for (let run = 0; run < 2; run++) {
-        const result = spawnSync('bash', [join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
+        const result = spawnSetup([join(f.source, 'setup'), '--host', 'codex', '--no-team', '--no-plan-tune-hooks', '--no-timeline-stop-hook'], {
           cwd: f.other, env: f.env, encoding: 'utf8', timeout: 60_000,
         });
         expect(result.status, result.stdout + result.stderr).toBe(1);

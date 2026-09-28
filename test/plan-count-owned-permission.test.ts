@@ -31,7 +31,7 @@ const hook=async(name,id,target)=>{
  for(const entry of settings.hooks[name]??[]){if(entry.matcher!=='^(Write|Edit)$')continue;const p=Bun.spawn(['bash','-c',entry.hooks[0].command],{stdin:new Blob([JSON.stringify(event)]),stdout:'pipe',stderr:'pipe'});const [code,out,err]=await Promise.all([p.exited,new Response(p.stdout).text(),new Response(p.stderr).text()]);if(code||out||err)throw Error('hook not silent');}
  log({type:'hook',name,id,target});
 };
-let stage='startup';const paint=target=>process.stdout.write('\x1b[2J\x1b[H'+item.screen.replaceAll('PLAN.md',target).replaceAll('\n','\r\n'));const request=async(id,target)=>{await hook('PreToolUse',id,target);stage=id;paint(target);};
+let stage='startup';const paint=target=>process.stdout.write('\x1b[2J\x1b[H'+item.screen.replaceAll('PLAN.md',target).replace('Do you want to make this edit to '+target+'?', 'Do you want to make this edit to '+path.basename(target)+'?').replaceAll('\n','\r\n'));const request=async(id,target)=>{await hook('PreToolUse',id,target);stage=id;paint(target);};
 process.stdin.setRawMode?.(true);let pendingInput='',inputQueue=Promise.resolve();const handleInput=async input=>{
  log({type:'input',stage,input});if(stage==='startup'){await request('report1',item.report);return;}
  if(stage.startsWith('wait')||stage==='done'){log({type:'unexpected'});return;}if(input!=='1\r')throw Error('one-time input changed');

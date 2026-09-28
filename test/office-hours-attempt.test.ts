@@ -8,6 +8,8 @@ import { EvalCollector, listEvalJsonFiles, isFinalizedEvalResultFile, type EvalT
 import { runSkillTest, SESSION_DRAIN_GRACE_MS, type SkillTestResult } from './helpers/session-runner';
 import { isPaidTestFile } from './helpers/paid-test-set';
 import { spawnSync, ChildProcess } from 'node:child_process';
+import * as childProcess from 'node:child_process';
+import { once } from 'node:events';
 import { Messages } from '@anthropic-ai/sdk/resources/messages';
 import { judgePosture } from './helpers/llm-judge';
 
@@ -242,32 +244,134 @@ async function withProcessFixture(body: string, check: (dir: string, env: Record
 }
 
 function running(pid: number): boolean {
-  const state = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim();
+  const result = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8', timeout: 2_000 });
+  if (result.error) throw result.error;
+  const state = result.stdout.trim();
+  if (result.status !== 0 && !(result.status === 1 && !state)) throw new Error('Owned process status query failed');
   return state.length > 0 && !state.startsWith('Z');
 }
 
-// The abort targets an already-observed exit with descendant-held pipes,
-// rather than racing the fixture's process startup against a 200ms timer.
-function abortAfterOwnedExit(dir: string, controller: AbortController) {
-  const parentFile = path.join(dir, 'parent.pid');
+// Observe only this fixture's expected dispatch, leaving process prototypes intact.
+function observeOwnedSpawn(dir: string, observe: (child: ChildProcess) => void) {
+  const spawn = childProcess.spawn;
+  const descriptor = Object.getOwnPropertyDescriptor(childProcess, 'spawn');
   const emit = ChildProcess.prototype.emit;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let exitCode: number | undefined;
-  const observer = spyOn(ChildProcess.prototype, 'emit').mockImplementation(function (this: ChildProcess, event: string | symbol, ...args: unknown[]) {
-    const emitted = emit.call(this, event, ...args);
-    if (event === 'exit' && this.spawnfile === 'claude' && fs.existsSync(parentFile)
-      && this.pid === Number(fs.readFileSync(parentFile, 'utf8').trim())) {
-      exitCode = typeof args[0] === 'number' ? args[0] : undefined;
-      timer = setTimeout(() => controller.abort(), 200);
+  const emitDescriptor = Object.getOwnPropertyDescriptor(ChildProcess.prototype, 'emit');
+  let dispatches = 0;
+  const observer = spyOn(childProcess, 'spawn').mockImplementation((...args: Parameters<typeof childProcess.spawn>) => {
+    const child = spawn(...args);
+    if (args[0] === 'claude' && args[2]?.cwd === dir && args[2]?.env?.FIXTURE_DIR === dir) {
+      dispatches++;
+      observe(child);
     }
-    return emitted;
+    return child;
   });
-  return { get exitCode() { return exitCode; }, dispose() { clearTimeout(timer); observer.mockRestore(); } };
+  return { get dispatches() { return dispatches; }, dispose() {
+    observer.mockRestore();
+    expect(childProcess.spawn).toBe(spawn);
+    expect(Object.getOwnPropertyDescriptor(childProcess, 'spawn')).toEqual(descriptor);
+    expect(ChildProcess.prototype.emit).toBe(emit);
+    expect(Object.getOwnPropertyDescriptor(ChildProcess.prototype, 'emit')).toEqual(emitDescriptor);
+  } };
 }
 
+// Start the same 200ms abort only after the owned exit has reached the runner.
+function abortAfterOwnedExit(dir: string, controller: AbortController) {
+  const parentFile = path.join(dir, 'parent.pid');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let exitCode: number | undefined;
+  const observer = observeOwnedSpawn(dir, child => child.once('exit', code => {
+    if (child.pid === Number(fs.readFileSync(parentFile, 'utf8').trim())) {
+      exitCode = code ?? undefined;
+      queueMicrotask(() => { timer = setTimeout(() => controller.abort(), 200); });
+    }
+  }));
+  return { get exitCode() { return exitCode; }, get dispatches() { return observer.dispatches; },
+    dispose() { clearTimeout(timer); observer.dispose(); } };
+}
+
+function abortAfterOwnedReady(dir: string, controller: AbortController, readyLine: string) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let child: ChildProcess | undefined;
+  let bytes = '', ready = false;
+  const onData = (data: Buffer) => {
+    bytes += data.toString();
+    if (!ready && bytes.split('\n').includes(readyLine) && child?.pid === Number(fs.readFileSync(path.join(dir, 'parent.pid'), 'utf8').trim())) {
+      ready = true;
+      timer = setTimeout(() => controller.abort(), 200);
+    }
+  };
+  const observer = observeOwnedSpawn(dir, owned => { child = owned; owned.stdout!.on('data', onData); });
+  return { get ready() { return ready; }, get dispatches() { return observer.dispatches; },
+    dispose() { clearTimeout(timer); child?.stdout?.removeListener('data', onData); observer.dispose(); } };
+}
+
+// Buffer real fixture output before starting the existing 200ms runner budget.
+async function withReadyProvider(dir: string, env: Record<string, string>, check: () => Promise<void>) {
+  const spawn = childProcess.spawn;
+  const descriptor = Object.getOwnPropertyDescriptor(childProcess, 'spawn');
+  const child = spawn('claude', [], { cwd: dir, env: { ...process.env, ...env }, stdio: ['pipe', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
+  let observer: ReturnType<typeof spyOn> | undefined;
+  let dispatches = 0;
+  let cleanupReady = () => {};
+  let rejectReady = (_error: Error) => {};
+  const ready = new Promise<void>((resolve, reject) => {
+    const stdout = child.stdout!;
+    const finish = (error?: Error) => { cleanupReady(); error ? reject(error) : resolve(); };
+    const onReadable = () => { if (stdout.readableLength > 0) finish(); };
+    const onClose = () => finish(new Error('Owned provider closed before readable output'));
+    const onError = (error: Error) => finish(error);
+    cleanupReady = () => { stdout.removeListener('readable', onReadable); stdout.removeListener('close', onClose); stdout.removeListener('error', onError); };
+    rejectReady = finish;
+    stdout.on('readable', onReadable).once('close', onClose).once('error', onError);
+    if (stdout.readableLength > 0) finish();
+    else if (stdout.destroyed) onClose();
+  });
+  const readyTimer = setTimeout(() => { child.kill('SIGKILL'); rejectReady(new Error('Owned provider produced no readable output within readiness deadline')); }, 2_000);
+  try {
+    await ready;
+    expect(child.stdout!.readableLength).toBeGreaterThan(0);
+    expect(child.pid).toBe(Number(fs.readFileSync(path.join(dir, 'parent.pid'), 'utf8').trim()));
+    clearTimeout(readyTimer);
+    observer = spyOn(childProcess, 'spawn').mockImplementation((...args: Parameters<typeof childProcess.spawn>) => {
+      if (args[0] === 'claude' && args[2]?.cwd === dir && args[2]?.env?.FIXTURE_DIR === dir) {
+        dispatches++;
+        return child;
+      }
+      return spawn(...args);
+    });
+    await check();
+    expect(dispatches).toBe(1);
+  } finally {
+    clearTimeout(readyTimer);
+    cleanupReady();
+    observer?.mockRestore();
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    if (child.exitCode === null && child.signalCode === null) await once(child, 'exit');
+    expect(childProcess.spawn).toBe(spawn);
+    expect(Object.getOwnPropertyDescriptor(childProcess, 'spawn')).toEqual(descriptor);
+  }
+}
+
+const readyLine = JSON.stringify({ type: 'system', subtype: 'owned_fixture_ready' });
 const successLine = JSON.stringify({ type: 'result', subtype: 'success', result: 'captured output', num_turns: 2, total_cost_usd: 0.12 });
 
 describe('Office Hours real session runner with fake processes', () => {
+  test('failed process status collection cannot prove an owned PID is gone', () => {
+    const spawn = childProcess.spawnSync;
+    const descriptor = Object.getOwnPropertyDescriptor(childProcess, 'spawnSync');
+    const failure = Object.assign(new Error('Owned ps collection timed out'), { code: 'ETIMEDOUT' });
+    const observer = spyOn(childProcess, 'spawnSync').mockReturnValue({ error: failure, pid: 0, status: null, signal: null, output: [], stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) });
+    try {
+      expect(() => running(process.pid)).toThrow(failure);
+      expect(observer).toHaveBeenCalledTimes(1);
+    } finally {
+      observer.mockRestore();
+      expect(childProcess.spawnSync).toBe(spawn);
+      expect(Object.getOwnPropertyDescriptor(childProcess, 'spawnSync')).toEqual(descriptor);
+    }
+  });
+
   test('a spawn failure closes both pipes and retains its diagnostic', async () => {
     await withProcessFixture('exit 0', async (dir) => {
       const captured = await runSkillTest({
@@ -302,11 +406,14 @@ describe('Office Hours real session runner with fake processes', () => {
   });
 
   test('abort kills the group, preserves captured usage, and cannot turn a success line into a pass', async () => {
-    await withProcessFixture(`echo '${successLine}'\nsleep 60 &\necho $! > "$FIXTURE_DIR/child.pid"\nwait`, async (dir, env) => {
+    await withProcessFixture(`echo '${successLine}'\nsleep 60 &\necho $! > "$FIXTURE_DIR/child.pid"\necho '${readyLine}'\nwait`, async (dir, env) => {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 200);
+      const abort = abortAfterOwnedReady(dir, controller, readyLine);
       try {
         const captured = await runSkillTest({ prompt: 'fixture', workingDirectory: dir, timeout: 30_000, env, signal: controller.signal });
+        expect(abort.ready).toBe(true);
+        expect(abort.dispatches).toBe(1);
+        expect(controller.signal.aborted).toBe(true);
         expect(captured.exitReason).toBe('timeout');
         expect(captured.output).toBe('captured output');
         expect(captured.costEstimate.estimatedCost).toBe(0.12);
@@ -314,7 +421,7 @@ describe('Office Hours real session runner with fake processes', () => {
         for (const file of ['parent.pid', 'child.pid']) {
           expect(running(Number(fs.readFileSync(path.join(dir, file), 'utf8')))).toBe(false);
         }
-      } finally { clearTimeout(timer); }
+      } finally { abort.dispose(); }
     });
   }, 10_000);
 
@@ -340,6 +447,7 @@ describe('Office Hours real session runner with fake processes', () => {
       try {
         const captured = await runSkillTest({ prompt: 'fixture', workingDirectory: dir, timeout: 30_000, env, signal: controller.signal });
         expect(abort.exitCode).toBe(7);
+        expect(abort.dispatches).toBe(1);
         expect(controller.signal.aborted).toBe(true);
         expect(captured.exitReason).toBe('exit_code_7');
         expect(captured.duration).toBeLessThan(2_000);
@@ -557,15 +665,25 @@ describe('session runner native CLI max-turns exit semantics', () => {
       try {
         const captured = await runSkillTest({ prompt: 'free fixture', workingDirectory: dir, timeout: 30_000, env, signal: controller.signal });
         expect(abort.exitCode).toBe(1);
+        expect(abort.dispatches).toBe(1);
         expect(controller.signal.aborted).toBe(true);
         expect(captured.exitReason).toBe('exit_code_1');
       } finally { abort.dispose(); }
     });
   });
+  test('owned ready provider rejects a silent exit and restores dispatch', async () => {
+    await withProcessFixture('exit 0', async (dir, env) => {
+      await expect(withReadyProvider(dir, env, async () => { throw new Error('Silent provider must not dispatch'); })).rejects.toThrow('closed before readable output');
+      expect(running(Number(fs.readFileSync(path.join(dir, 'parent.pid'), 'utf8')))).toBe(false);
+    });
+  });
   test('a timeout cannot be overwritten by a max-turn result line', async () => {
     await withProcessFixture(`echo '${maxTurnsLine}'\nexec sleep 60`, async (dir, env) => {
-      const captured = await runSkillTest({ prompt: 'free fixture', workingDirectory: dir, timeout: 200, env });
-      expect(captured.exitReason).toBe('timeout');
+      await withReadyProvider(dir, env, async () => {
+        const captured = await runSkillTest({ prompt: 'free fixture', workingDirectory: dir, timeout: 200, env });
+        expect(captured.costEstimate.turnsUsed).toBe(8);
+        expect(captured.exitReason).toBe('timeout');
+      });
     });
   });
 });
