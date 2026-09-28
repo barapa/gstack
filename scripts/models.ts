@@ -20,7 +20,7 @@ export const ALL_MODEL_NAMES = [
   'opus-4-7',
   'fable-5',
   'opus-4-8',
-  'sonnet-5',
+  'sonnet-5-5',
   'gpt',
   'gpt-5.4',
   'gpt-5.6-sol',
@@ -41,7 +41,8 @@ export type Model = (typeof ALL_MODEL_NAMES)[number];
  *    - `gpt-5.4-mini`, `gpt-5.4-turbo`, `gpt-5.4-*` → `gpt-5.4`
  *    - `gpt-*` (anything else GPT, including other 5.6 variants) → `gpt`
  *    - `o3`, `o4`, `o4-mini`, `o1`, `o1-mini`, `o1-pro` → `o-series`
- *    - `claude-*` (sonnet, opus, haiku, any version) → `claude`
+ *    - `claude-sonnet-5-5` (including dated IDs) → `sonnet-5-5`
+ *    - `claude-*` (other sonnet, opus, haiku versions) → `claude`
  *    - `gemini-*` (2.5-pro, flash, etc.) → `gemini`
  * 3. Unknown input → returns null (caller decides: error, or fall back).
  *
@@ -70,7 +71,7 @@ export function resolveModel(input: string): Model | null {
   if (/^claude-opus-4-7(-|$)/.test(s)) return 'opus-4-7';
   if (/^claude-fable-5(-|$)/.test(s)) return 'fable-5';
   if (/^claude-opus-4-8(-|$)/.test(s)) return 'opus-4-8';
-  if (/^claude-sonnet-5(-|$)/.test(s)) return 'sonnet-5';
+  if (/^claude-sonnet-5-5(-|$)/.test(s)) return 'sonnet-5-5';
   if (/^claude(-|$)/.test(s)) return 'claude';
   if (/^gemini(-|$)/.test(s)) return 'gemini';
 

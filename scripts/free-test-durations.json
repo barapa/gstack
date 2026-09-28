@@ -708,7 +708,7 @@
     "test/model-overlay-gpt-6-astra.test.ts": 17,
     "test/model-overlay-opus-4-7.test.ts": 22,
     "test/model-overlay-opus-4-8.test.ts": 18,
-    "test/model-overlay-sonnet-5.test.ts": 18,
+    "test/model-overlay-sonnet-5-5.test.ts": 18,
     "test/native-auto-decide-pty.test.ts": 33004,
     "test/native-auto-decide.test.ts": 94,
     "test/no-quoted-tilde-assignments.test.ts": 29,
