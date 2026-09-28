@@ -237,3 +237,43 @@ test.skipIf(process.platform === 'win32').each([120, 240].flatMap(cols => [
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 }, 12_000);
+
+
+test.skipIf(process.platform === 'win32')('owned PTY sessions decode split UTF-8 glyphs and flush an incomplete final byte', async () => {
+  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'native-utf8-free-')));
+  const native = path.join(tmp, 'native.ts'), wrapper = path.join(tmp, 'native-wrapper'), probe = path.join(tmp, 'probe.ts');
+  const quote = (value: string) => "'" + value.replace(/'/g, "'\\''") + "'";
+  fs.writeFileSync(native, `const bytes=Buffer.from('❯ ─ 設 😀');
+    for (const byte of bytes) { process.stdout.write(Buffer.from([byte])); await Bun.sleep(15); }
+    process.stdout.write('\\r\\nUTF8_READY\\r\\n'); await Bun.sleep(300);
+    process.stdout.write(Buffer.from([0xe2])); process.exit(0);`);
+  fs.writeFileSync(wrapper, '#!/bin/sh\nexec ' + quote(process.execPath) + ' ' + quote(native) + '\n', { mode: 0o700 });
+  fs.writeFileSync(probe, `import { launchClaudePty } from ${JSON.stringify(path.join(import.meta.dir, 'helpers', 'claude-pty-runner.ts'))};
+    const session=await launchClaudePty({cwd:${JSON.stringify(tmp)},observeScreen:true,timeoutMs:5000});
+    try {
+      await session.waitFor('UTF8_READY',{timeoutMs:2000});
+      const raw=session.rawOutput(),viewport=await session.currentScreen();
+      const deadline=Date.now()+2000;
+      while(!session.exited()&&Date.now()<deadline)await Bun.sleep(20);
+      if(!session.exited())throw new Error('Native UTF-8 child failed to exit');
+      await session.close();
+      console.log(JSON.stringify({raw,viewport,finalRaw:session.rawOutput()}));
+    } finally { await session.close(); }`);
+  const child = Bun.spawn([process.execPath, probe], { cwd: tmp, env: {
+    PATH: process.env.PATH ?? '', HOME: tmp, TMPDIR: tmp, TERM: 'xterm-256color',
+    EVALS_HERMETIC: '1', BROWSE_TERMINAL_BINARY: wrapper,
+  }, stdout: 'pipe', stderr: 'pipe' });
+  try {
+    const [stdout, stderr, exit] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    expect(exit, stderr).toBe(0);
+    const result = JSON.parse(stdout.trim());
+    expect(result.raw).toContain('❯ ─ 設 😀');
+    expect(result.viewport).toContain('❯ ─ 設 😀');
+    expect(result.raw).not.toContain('�');
+    expect(result.viewport).not.toContain('�');
+    expect(result.finalRaw).toBe(result.raw + '�');
+  } finally {
+    if (child.exitCode === null) { child.kill(); await child.exited; }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}, 8000);

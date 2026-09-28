@@ -15,6 +15,8 @@ describe.skipIf(process.platform === 'win32')('Chromium profile isolation (#2817
   let env: Record<string, string>;
   let children: ReturnType<typeof Bun.spawn>[];
   let daemonPid: number | undefined;
+  let daemonStartTime: string | undefined;
+  let ownershipWatch: fs.FSWatcher | undefined;
 
   beforeEach(() => {
     scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'browse-profile-isolation-'));
@@ -43,17 +45,22 @@ describe.skipIf(process.platform === 'win32')('Chromium profile isolation (#2817
     });
     children = [];
     daemonPid = undefined;
+    daemonStartTime = undefined;
+    ownershipWatch = undefined;
   });
 
   afterEach(async () => {
-    if (fs.existsSync(stateFile)) {
-      daemonPid = JSON.parse(fs.readFileSync(stateFile, 'utf-8')).pid;
-    }
-    if (daemonPid) safeKill(-daemonPid, 'SIGKILL');
+    ownershipWatch?.close();
+    ownershipWatch = undefined;
+    if (isOwnedDaemonAlive(daemonPid, daemonStartTime)) safeKill(-daemonPid!, 'SIGKILL');
     for (const child of children) child.kill('SIGKILL');
     await Promise.all(children.map(child => child.exited));
     fs.rmSync(scratch, { recursive: true, force: true });
   });
+
+  function isOwnedDaemonAlive(pid: number | undefined, startTime: string | undefined): boolean {
+    return Boolean(pid && startTime && isProcessAlive(pid) && readPidStartTime(pid) === startTime);
+  }
 
   async function spawnChromiumHolder() {
     const script = path.join(scratch, `chromium-holder-${children.length}.ts`);
@@ -94,15 +101,50 @@ describe.skipIf(process.platform === 'win32')('Chromium profile isolation (#2817
       stderr: 'pipe',
     });
     children.push(child);
-    const [code, stdout, stderr] = await Promise.all([
-      child.exited,
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-    ]);
-    if (fs.existsSync(stateFile)) daemonPid = JSON.parse(fs.readFileSync(stateFile, 'utf-8')).pid;
+    const rememberDaemon = () => {
+      if (daemonStartTime || !fs.existsSync(stateFile)) return;
+      let pid: number;
+      try { pid = JSON.parse(fs.readFileSync(stateFile, 'utf-8')).pid; }
+      catch (error) {
+        if (error instanceof SyntaxError || (error as NodeJS.ErrnoException).code === 'ENOENT') return;
+        throw error;
+      }
+      const startTime = readPidStartTime(pid);
+      if (startTime) { daemonPid = pid; daemonStartTime = startTime; }
+    };
+    // Record ownership while the CLI is running, including a failed launch
+    // that publishes state before the CLI exits or reaches its test deadline.
+    ownershipWatch = fs.watch(path.dirname(stateFile), (_event, filename) => {
+      if (filename === path.basename(stateFile)) rememberDaemon();
+    });
+    let code: number, stdout: string, stderr: string;
+    try {
+      [code, stdout, stderr] = await Promise.all([
+        child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+      ]);
+      rememberDaemon();
+    } finally { ownershipWatch?.close(); ownershipWatch = undefined; }
     const log = path.join(path.dirname(stateFile), 'browse-daemon.log');
     expect(code, stdout + stderr + (fs.existsSync(log) ? fs.readFileSync(log, 'utf-8') : '')).toBe(0);
   }
+
+  test('failed startup retains the first owned daemon identity for cleanup', async () => {
+    const serverScript = path.join(scratch, 'unhealthy-server.ts');
+    fs.writeFileSync(serverScript, `
+      import * as fs from 'node:fs';
+      const server = Bun.serve({ hostname: '127.0.0.1', port: 0,
+        fetch: () => Response.json({ status: 'unhealthy' }), });
+      fs.writeFileSync(process.env.BROWSE_STATE_FILE!, JSON.stringify({
+        pid: process.pid, port: server.port, token: 'test-token', mode: 'launched',
+      }));
+    `);
+    env.BROWSE_SERVER_SCRIPT = serverScript;
+    env.BROWSE_START_TIMEOUT = '500';
+    await expect(runCli(['status'])).rejects.toThrow();
+    expect(daemonPid).toBeGreaterThan(0);
+    expect(daemonStartTime).not.toBe('');
+    expect(isOwnedDaemonAlive(daemonPid, daemonStartTime)).toBe(false);
+  }, 60_000);
 
   test('headless startup leaves another project\'s live headed lock holder and locks alone', async () => {
     const holder = await spawnChromiumHolder();
@@ -112,6 +154,7 @@ describe.skipIf(process.platform === 'win32')('Chromium profile isolation (#2817
 
     expect(daemonPid).toBeGreaterThan(0);
     expect(isProcessAlive(daemonPid!)).toBe(true);
+    expect(isOwnedDaemonAlive(daemonPid, `${daemonStartTime}-reused`)).toBe(false);
     expectLocksIntact(holder.pid);
   }, 60_000);
 
@@ -174,11 +217,15 @@ describe.skipIf(process.platform === 'win32')('Chromium profile isolation (#2817
       const holder = await spawnChromiumHolder();
       seedLocks(holder.pid);
 
+      const stoppedDaemonPid = daemonPid;
+      const stoppedDaemonStartTime = daemonStartTime;
       await runCli(args);
       const deadline = Date.now() + 10000;
-      while (fs.existsSync(stateFile) && Date.now() < deadline) await Bun.sleep(50);
+      while ((fs.existsSync(stateFile) || isOwnedDaemonAlive(stoppedDaemonPid, stoppedDaemonStartTime))
+        && Date.now() < deadline) await Bun.sleep(50);
 
       expect(fs.existsSync(stateFile)).toBe(false);
+      expect(isOwnedDaemonAlive(stoppedDaemonPid, stoppedDaemonStartTime)).toBe(false);
       expectLocksIntact(holder.pid);
     }, 60_000);
   }

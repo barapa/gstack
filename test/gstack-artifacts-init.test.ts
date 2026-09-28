@@ -552,7 +552,10 @@ describe('gstack-artifacts-init idempotency', () => {
       'for arg in "$@"; do',
       '  case "$arg" in',
       '    "$GSTACK_HOME"/.brain-allowlist.*)',
-      '      if /bin/grep -qF \'# Canonical allowlist of paths that gstack-brain-sync will publish.\' "$arg"; then /bin/head -c 32 "$arg"; exit 73; fi',
+      '      if grep -qF \'# Canonical allowlist of paths that gstack-brain-sync will publish.\' "$arg"; then',
+      '        : > "$GSTACK_HOME/.assembly-failure-triggered"',
+      '        head -c 32 "$arg"; exit 73',
+      '      fi',
       '      ;;',
       '  esac',
       'done',
@@ -561,6 +564,7 @@ describe('gstack-artifacts-init idempotency', () => {
     ].join('\n'), { mode: 0o755 });
 
     const r = run(['--remote', url]);
+    expect(fs.existsSync(path.join(tmpHome, '.assembly-failure-triggered'))).toBe(true);
     expect(r.status).not.toBe(0);
     expect(fs.readFileSync(allowlist)).toEqual(previous);
     expectNoAllowlistTemps();

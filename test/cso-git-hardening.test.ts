@@ -60,12 +60,17 @@ describe('CSO Git metadata hardening',()=>{
     fs.mkdirSync(empty);fs.writeFileSync(excludes,'untracked-security.ts\n');
     fs.writeFileSync(path.join(repo,'untracked-security.ts'),'export const vulnerable = true\n');
     fs.writeFileSync(path.join(repo,'TRACKED.ts'),'export const caseVariant = true\n');
+    // The second write adds a file on case-sensitive hosts and changes the
+    // tracked file on case-insensitive hosts. Prove capture of its actual bytes.
+    const caseVariant=fs.readdirSync(repo).includes('TRACKED.ts')?'TRACKED.ts':'tracked.ts';
     git('config','core.worktree',empty);git('config','core.excludesFile',excludes);git('config','core.ignoreCase','true');git('config','core.precomposeUnicode','true');
 
     const manifest=await capture(repo,runDir,'HEAD');
 
     expect(manifest.entries.map(entry=>entry.path)).toContain('untracked-security.ts');
-    expect(manifest.entries.map(entry=>entry.path)).toContain('TRACKED.ts');
+    expect(manifest.entries.map(entry=>entry.path)).toContain(caseVariant);
+    expect(fs.readFileSync(path.join(runDir,'snapshot',caseVariant),'utf8')).toContain('caseVariant');
+    expect(manifest.changedPaths).toContain(caseVariant);
     expect(fs.readFileSync(path.join(runDir,'snapshot','untracked-security.ts'),'utf8')).toContain('vulnerable');
     expect(manifest.changedPaths).toContain('untracked-security.ts');
   });

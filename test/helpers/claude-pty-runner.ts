@@ -26,6 +26,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { stripVTControlCharacters, isDeepStrictEqual } from 'node:util';
+import { StringDecoder } from 'node:string_decoder';
 import { hermeticChildEnv, hermeticSkillsConfigDir, isHermeticEnabled } from './hermetic-env';
 import { withHermeticSkillRuntime } from './hermetic-skill-runtime';
 import { createPlanCountFixture, ownedNativeReviewStateRoot, type NativeReviewState } from './plan-count-fixture';
@@ -4024,6 +4025,7 @@ export async function launchClaudePty(
   const timeoutMs = opts.timeoutMs ?? 240_000;
 
   let buffer = '';
+  const utf8Decoder = new StringDecoder('utf8');
   let exited = false;
   let closing = false;
   let exitCodeCaptured: number | null = null;
@@ -4124,7 +4126,7 @@ export async function launchClaudePty(
       cols,
       rows,
       data(_t: unknown, chunk: Buffer) {
-        const text = chunk.toString('utf-8');
+        const text = utf8Decoder.write(chunk);
         buffer += text;
         if (screen && !screenClosing) screen.write(text);
         notifyOutput();
@@ -4139,6 +4141,9 @@ export async function launchClaudePty(
   if (proc.exited && typeof proc.exited.then === 'function') {
     exitedPromise = proc.exited
       .then(async (code: number | null) => {
+        const trailing = utf8Decoder.end();
+        buffer += trailing;
+        if (trailing && screen && !screenClosing) screen.write(trailing);
         exitCodeCaptured = code;
         exited = true;
         notifyOutput();

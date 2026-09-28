@@ -28,6 +28,11 @@ function runScan(host: 'claude' | 'codex', body: string, scanner: 'real' | 'brok
   const sinks = join(scratch, 'sinks');
   const temps = join(scratch, 'tmp');
   for (const dir of [bin, sinks, temps]) mkdirSync(dir, { recursive: true });
+  const realMktemp = Bun.which('mktemp');
+  if (!realMktemp) throw new Error('mktemp is required for the spec sink fixture');
+  // BSD mktemp without arguments ignores TMPDIR; keep this child's pending
+  // artifact inside the fixture without changing the generated fence.
+  writeFileSync(join(bin, 'mktemp'), '#!/usr/bin/env bash\nif [ "$#" -eq 0 ]; then exec "$FIXTURE_REAL_MKTEMP" "$TMPDIR/gstack-spec.XXXXXXXXXX"; fi\nexec "$FIXTURE_REAL_MKTEMP" "$@"\n', { mode: 0o755 });
   writeFileSync(join(bin, 'gstack-config'), '#!/usr/bin/env bash\nprintf "public\\n"\n', { mode: 0o755 });
   if (scanner === 'real') symlinkSync(join(ROOT, 'bin/gstack-redact'), join(bin, 'gstack-redact'));
   if (scanner === 'broken') writeFileSync(join(bin, 'gstack-redact'), '#!/usr/bin/env bash\nexit 70\n', { mode: 0o755 });
@@ -51,7 +56,8 @@ rm -f "$REDACT_FILE"
 `;
   try {
     const result = Bun.spawnSync(['bash', '-c', script], { cwd: scratch,
-      env: { ...process.env, GSTACK_ROOT: runtime, GSTACK_BIN: bin, SINK_DIR: sinks, TMPDIR: temps },
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH || ''}`, FIXTURE_REAL_MKTEMP: realMktemp,
+        GSTACK_ROOT: runtime, GSTACK_BIN: bin, SINK_DIR: sinks, TMPDIR: temps },
       stdout: 'pipe', stderr: 'pipe', timeout: 10_000,
     });
     return { code: result.exitCode, stdout: result.stdout.toString(), stderr: result.stderr.toString(),

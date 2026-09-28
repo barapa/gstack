@@ -1,3 +1,4 @@
+import { StringDecoder } from 'node:string_decoder';
 import { expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -25,13 +26,18 @@ for (const scenario of ['success', 'completed-tool', 'status-updating', 'history
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'plan-seed-')));
     const config = path.join(dir, '.claude'); fs.mkdirSync(config);
     const script = path.join(dir, 'cli.ts'); fs.writeFileSync(script, CLI);
+    const utf8Decoder = new StringDecoder('utf8');
     const decoder = new PtyCurrentScreen({ cols: 120, rows: 40 });
-    let raw = '', exited = false;
+    let raw = '', exited = false, projectionDisposed = false;
     const launchedAt = Date.now();
     const proc = Bun.spawn([process.execPath, script], {
       cwd: dir, env: { ...process.env, CLAUDE_CONFIG_DIR: config, SEED_CASE: scenario },
-      terminal: { cols: 120, rows: 40, data(_terminal, data) { const s = Buffer.from(data).toString(); raw += s; decoder.feed(s); } },
-      onExit() { exited = true; },
+      terminal: { cols: 120, rows: 40, data(_terminal, data) { const s = utf8Decoder.write(Buffer.from(data)); raw += s; decoder.feed(s); } },
+      onExit() {
+        const trailing = utf8Decoder.end(); raw += trailing;
+        if (trailing && !projectionDisposed) decoder.feed(trailing);
+        exited = true;
+      },
     });
     const sent: string[] = [];
     const session = {
@@ -79,7 +85,7 @@ for (const scenario of ['success', 'completed-tool', 'status-updating', 'history
     } finally {
       if (!exited) proc.kill();
       await proc.exited;
-      proc.terminal?.close(); decoder.dispose();
+      proc.terminal?.close(); projectionDisposed = true; decoder.dispose();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   }, 6000);

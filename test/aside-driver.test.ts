@@ -193,10 +193,12 @@ describe('Aside driver contract ({{ASIDE_SETUP}})', () => {
       const shells = ['sh', 'bash', 'zsh'].map(executable).filter((shell): shell is string => !!shell);
       expect(shells.length).toBeGreaterThan(0);
       const base = shellPath(path.join(dir, 'base'));
+      // Keep zsh startup files from replacing the fixture-owned PATH.
+      const ZDOTDIR = shellPath(dir);
       for (const arm of arms) {
         const PATH = arm === 'none' ? base : `${shellPath(path.join(dir, arm))}:${base}`;
         for (const shell of shells) {
-          const r = spawnSync(shell, ['-c', setupProbe], { env: { PATH }, encoding: 'utf8', timeout: 30_000 });
+          const r = spawnSync(shell, ['-c', setupProbe], { env: { PATH, ZDOTDIR }, encoding: 'utf8', timeout: 30_000 });
           const status = arm === 'none' ? 'ASIDE_UNAVAILABLE: bounded probe unavailable' : 'READY: aside';
           const name = path.basename(shell).replace(/\.exe$/i, '');
           expect(`${name}/${arm}: ${r.stdout.trim()}`).toBe(`${name}/${arm}: ${status}`);
@@ -205,7 +207,7 @@ describe('Aside driver contract ({{ASIDE_SETUP}})', () => {
       const reasons = { window: 'No browser window is open for account u0', preload: "Error: Cannot find module '/x/preload.cjs'" };
       for (const [name, reason] of Object.entries(reasons)) {
         for (const shell of shells) {
-          const r = spawnSync(shell, ['-c', setupProbe], { env: { PATH: `${shellPath(path.join(dir, 'gt'))}:${shellPath(path.join(dir, name))}` }, encoding: 'utf8', timeout: 30_000 });
+          const r = spawnSync(shell, ['-c', setupProbe], { env: { PATH: `${shellPath(path.join(dir, 'gt'))}:${shellPath(path.join(dir, name))}`, ZDOTDIR }, encoding: 'utf8', timeout: 30_000 });
           const executableName = path.basename(shell).replace(/\.exe$/i, '');
           expect(`${executableName}/${name}: ${r.stdout.trim()}`).toBe(`${executableName}/${name}: ASIDE_CLI_ERROR: exit 1; inspect aside --help locally`);
           expect(r.stdout).not.toContain(reason);
@@ -213,9 +215,9 @@ describe('Aside driver contract ({{ASIDE_SETUP}})', () => {
       }
       // Both ways out stay reachable: opted out, and Aside not installed (empty PATH dir).
       const sh = shells[0];
-      const optOut = spawnSync(sh, ['-c', setupProbe], { env: { PATH: base, GSTACK_SKIP_ASIDE: '1' }, encoding: 'utf8', timeout: 30_000 });
+      const optOut = spawnSync(sh, ['-c', setupProbe], { env: { PATH: base, ZDOTDIR, GSTACK_SKIP_ASIDE: '1' }, encoding: 'utf8', timeout: 30_000 });
       expect(optOut.stdout.trim()).toBe('NEEDS_ASIDE');
-      const noAside = spawnSync(sh, ['-c', setupProbe], { env: { PATH: shellPath(path.join(dir, 'gt')) }, encoding: 'utf8', timeout: 30_000 });
+      const noAside = spawnSync(sh, ['-c', setupProbe], { env: { PATH: shellPath(path.join(dir, 'gt')), ZDOTDIR }, encoding: 'utf8', timeout: 30_000 });
       expect(noAside.stdout.trim()).toBe('NEEDS_ASIDE');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });

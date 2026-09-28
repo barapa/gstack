@@ -587,10 +587,12 @@ fs.writeFileSync(path.join(root,'results.json'),JSON.stringify({results,privateR
       expect(args).toContain('--strict-mcp-config');expect(args).not.toContain('--mcp-config');expect(args).not.toContain('-p');
       expect(result.observed.headless).toBe('');
       const prompt=args.find((arg:string)=>arg.startsWith('The ONLY skill file'));
-      expect(prompt).toContain(path.join(dir,result.kind,'plan-eng-review','SKILL.md'));
+      const ownedSkillPath=path.join(dir,result.kind,'plan-eng-review','SKILL.md');
+      expect(prompt).toContain(ownedSkillPath);
       expect(prompt).toContain('Review plan.md.');expect(prompt).toContain('Skip any system-audit / environment-setup / codebase-exploration steps.');
       expect(prompt).toContain('ask the user through the AskUserQuestion tool');
-      for(const absent of ['verbatim','would call','write the','ELI10','Pros / cons:','Net:','private','reasoning']) expect(prompt).not.toContain(absent);
+      const prose=prompt.replaceAll(ownedSkillPath,'<owned-skill>');
+      for(const absent of ['verbatim','would call','write the','ELI10','Pros / cons:','Net:','private','reasoning']) expect(prose).not.toContain(absent);
       if(result.kind.endsWith('artifact-error')){
         expect(result.receipt).toBeNull();expect(result.text).toBeUndefined();
         expect(result.error).toContain(result.kind==='artifact-error'?'fixture receipt disk full':'[reasoning_extraction]');
