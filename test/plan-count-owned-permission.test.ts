@@ -16,7 +16,7 @@ test('new permission grammar requires matching file pane and complete native per
   expect(createPlanCountPermissionGuard()(screen,''),screen).not.toBe('grant');expect(classifyPlanCountFrame(screen),screen).not.toBe('permission');
  }
 });
-test.skipIf(process.platform==='win32')('real fake CLI binds only report and owned PLAN epochs across redraws and path switches',async()=>{
+test.skipIf(process.platform==='win32').each(['native','split-bytes'] as const)('real fake CLI binds only report and owned PLAN epochs across redraws and path switches (%s)',async transport=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'owned-plan-epoch-')),fake=path.join(dir,'fake-claude'),worker=path.join(dir,'worker.ts'),events=path.join(dir,'events.jsonl'),output=path.join(dir,'result.json'),report=path.join(dir,'report.md');fs.writeFileSync(report,'original');
  fs.writeFileSync(fake,`#!${process.execPath}\n`+String.raw`
 import * as fs from 'node:fs';import * as path from 'node:path';
@@ -32,20 +32,29 @@ const hook=async(name,id,target)=>{
  log({type:'hook',name,id,target});
 };
 let stage='startup';const paint=target=>process.stdout.write('\x1b[2J\x1b[H'+item.screen.replaceAll('PLAN.md',target).replaceAll('\n','\r\n'));const request=async(id,target)=>{await hook('PreToolUse',id,target);stage=id;paint(target);};
-process.stdin.setRawMode?.(true);process.stdin.on('data',async data=>{
- const input=data.toString();log({type:'input',stage,input});if(stage==='startup'){await request('report1',item.report);return;}
+process.stdin.setRawMode?.(true);let pendingInput='',inputQueue=Promise.resolve();const handleInput=async input=>{
+ log({type:'input',stage,input});if(stage==='startup'){await request('report1',item.report);return;}
  if(stage.startsWith('wait')||stage==='done'){log({type:'unexpected'});return;}if(input!=='1\r')throw Error('one-time input changed');
  if(stage==='report1'){await hook('PostToolUse','report1',item.report);await request('plan1',plan);return;}
  if(stage==='plan1'){stage='wait-old-plan';await hook('PostToolUse','plan1',plan);paint(plan);setTimeout(async()=>{await hook('PreToolUse','plan1',plan);await hook('PreToolUse','foreign',path.join(process.cwd(),'OTHER.md'));paint(plan);},1000);setTimeout(async()=>{await request('plan2',plan);},3200);return;}
  if(stage==='plan2'){stage='wait-old-report';await hook('PostToolUse','plan2',plan);paint(item.report);setTimeout(async()=>{await request('report2',item.report);},3200);return;}
  await hook('PostToolUse','report2',item.report);stage='done';const q={header:'Finding',question:'Apply the reviewed fix?',options:[{label:'Fix'},{label:'Keep'}]};native('assistant',[{type:'tool_use',name:'AskUserQuestion',id:'finding',input:{questions:[q]}}]);native('user',[{type:'tool_result',tool_use_id:'finding',content:'Answered'}],{toolUseResult:{answers:{[q.question]:'Fix'}}});process.stdout.write('\x1b[2J\x1b[HDone.\r\n');
+};process.stdin.on('data',data=>{
+ const fragments=item.transport==='split-bytes'?[...data.toString()]:[data.toString()];
+ for(const fragment of fragments){
+  log({type:'fragment',input:fragment});pendingInput+=fragment;let end;
+  while((end=pendingInput.indexOf('\r'))!==-1){
+   const input=pendingInput.slice(0,end+1);pendingInput=pendingInput.slice(end+1);
+   inputQueue=inputQueue.then(()=>handleInput(input)).catch(error=>{console.error(error);process.exit(1);});
+  }
+ }
 });process.on('SIGINT',()=>process.exit(0));process.stdin.resume();
 process.stdout.write('PTY_READY:'+item.events+'\x1b[2J\x1b[H');
 `);fs.chmodSync(fake,0o755);
- const args={skillName:'plan-ceo-review',slashCommand:'/plan-ceo-review',followUpPrompt:'Review this owned fixture.',expectedPlanPath:report,reviewCountCeiling:1,timeoutMs:37000,startupReadyMarker:'PTY_READY:'+events,env:{OWNED_EPOCH_CASE:JSON.stringify({events,report,screen:capture.screen})}};
+ const args={skillName:'plan-ceo-review',slashCommand:'/plan-ceo-review',followUpPrompt:'Review this owned fixture.',expectedPlanPath:report,reviewCountCeiling:1,timeoutMs:37000,startupReadyMarker:'PTY_READY:'+events,env:{OWNED_EPOCH_CASE:JSON.stringify({events,report,screen:capture.screen,transport})}};
  fs.writeFileSync(worker,`import {runPlanSkillCounting} from ${JSON.stringify(pathToFileURL(path.join(import.meta.dir,'helpers/claude-pty-runner.ts')).href)};const result=await runPlanSkillCounting({...${JSON.stringify(args)},isLastStep0AUQ:()=>false,isReviewAUQ:()=>true});await Bun.write(${JSON.stringify(output)},JSON.stringify(result));`);
  const child=Bun.spawn([process.execPath,worker],{env:{...process.env,BROWSE_TERMINAL_BINARY:fake,EVALS_HERMETIC:'1'},stdout:'pipe',stderr:'pipe'}),killer=setTimeout(()=>child.kill('SIGKILL'),42000);
- try{const [code,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);expect(code,out+err).toBe(0);const result=JSON.parse(fs.readFileSync(output,'utf8'));expect(result.outcome,JSON.stringify(result)).toBe('ceiling_reached');expect(result.reviewCount).toBe(1);const rows=fs.readFileSync(events,'utf8').trim().split('\n').map(l=>JSON.parse(l));expect(rows[0].hookCount).toBe(2);expect(rows.filter(r=>r.type==='input').map(r=>[r.stage,r.input])).toEqual([['startup','/plan-ceo-review\r'],['report1','1\r'],['plan1','1\r'],['plan2','1\r'],['report2','1\r']]);expect(rows.some(r=>r.type==='unexpected')).toBe(false);expect(()=>process.kill(rows[0].pid,0)).toThrow();expect(fs.existsSync(rows[0].cwd)).toBe(false);
+ try{const [code,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);expect(code,out+err).toBe(0);const result=JSON.parse(fs.readFileSync(output,'utf8'));expect(result.outcome,JSON.stringify(result)).toBe('ceiling_reached');expect(result.reviewCount).toBe(1);const rows=fs.readFileSync(events,'utf8').trim().split('\n').map(l=>JSON.parse(l));expect(rows[0].hookCount).toBe(2);expect(rows.filter(r=>r.type==='input').map(r=>[r.stage,r.input])).toEqual([['startup','/plan-ceo-review\r'],['report1','1\r'],['plan1','1\r'],['plan2','1\r'],['report2','1\r']]);expect(rows.some(r=>r.type==='unexpected')).toBe(false);const fragments=rows.filter(r=>r.type==='fragment');expect(fragments.map(r=>r.input).join('')).toBe('/plan-ceo-review\r'+'1\r'.repeat(4));if(transport==='split-bytes'){expect(fragments.every(r=>r.input.length===1)).toBe(true);}expect(()=>process.kill(rows[0].pid,0)).toThrow();expect(fs.existsSync(rows[0].cwd)).toBe(false);
  }finally{
   clearTimeout(killer);child.kill('SIGKILL');await child.exited;
   if(fs.existsSync(events)){

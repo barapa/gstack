@@ -7,7 +7,7 @@ import { OFFICE_HOURS_BUN_GRACE_MS, OFFICE_HOURS_RECORD_GRACE_MS, runRecordedOff
 import { EvalCollector, listEvalJsonFiles, isFinalizedEvalResultFile, type EvalTestEntry } from './helpers/eval-store';
 import { runSkillTest, SESSION_DRAIN_GRACE_MS, type SkillTestResult } from './helpers/session-runner';
 import { isPaidTestFile } from './helpers/paid-test-set';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, ChildProcess } from 'node:child_process';
 import { Messages } from '@anthropic-ai/sdk/resources/messages';
 import { judgePosture } from './helpers/llm-judge';
 
@@ -246,6 +246,25 @@ function running(pid: number): boolean {
   return state.length > 0 && !state.startsWith('Z');
 }
 
+// The abort targets an already-observed exit with descendant-held pipes,
+// rather than racing the fixture's process startup against a 200ms timer.
+function abortAfterOwnedExit(dir: string, controller: AbortController) {
+  const parentFile = path.join(dir, 'parent.pid');
+  const emit = ChildProcess.prototype.emit;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let exitCode: number | undefined;
+  const observer = spyOn(ChildProcess.prototype, 'emit').mockImplementation(function (this: ChildProcess, event: string | symbol, ...args: unknown[]) {
+    const emitted = emit.call(this, event, ...args);
+    if (event === 'exit' && this.spawnfile === 'claude' && fs.existsSync(parentFile)
+      && this.pid === Number(fs.readFileSync(parentFile, 'utf8').trim())) {
+      exitCode = typeof args[0] === 'number' ? args[0] : undefined;
+      timer = setTimeout(() => controller.abort(), 200);
+    }
+    return emitted;
+  });
+  return { get exitCode() { return exitCode; }, dispose() { clearTimeout(timer); observer.mockRestore(); } };
+}
+
 const successLine = JSON.stringify({ type: 'result', subtype: 'success', result: 'captured output', num_turns: 2, total_cost_usd: 0.12 });
 
 describe('Office Hours real session runner with fake processes', () => {
@@ -317,12 +336,14 @@ describe('Office Hours real session runner with fake processes', () => {
   test('abort during a failed process drain preserves the independently observed exit', async () => {
     await withProcessFixture(`echo '${successLine}'\nsleep 60 &\necho $! > "$FIXTURE_DIR/child.pid"\nexit 7`, async (dir, env) => {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 200);
+      const abort = abortAfterOwnedExit(dir, controller);
       try {
         const captured = await runSkillTest({ prompt: 'fixture', workingDirectory: dir, timeout: 30_000, env, signal: controller.signal });
+        expect(abort.exitCode).toBe(7);
+        expect(controller.signal.aborted).toBe(true);
         expect(captured.exitReason).toBe('exit_code_7');
         expect(captured.duration).toBeLessThan(2_000);
-      } finally { clearTimeout(timer); }
+      } finally { abort.dispose(); }
     });
   }, 10_000);
 
@@ -532,11 +553,13 @@ describe('session runner native CLI max-turns exit semantics', () => {
   test('abort during a max-turn exit 1 drain retains the process failure', async () => {
     await withProcessFixture(`echo '${maxTurnsLine}'\nsleep 60 &\necho $! > "$FIXTURE_DIR/child.pid"\nexit 1`, async (dir, env) => {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 200);
+      const abort = abortAfterOwnedExit(dir, controller);
       try {
         const captured = await runSkillTest({ prompt: 'free fixture', workingDirectory: dir, timeout: 30_000, env, signal: controller.signal });
+        expect(abort.exitCode).toBe(1);
+        expect(controller.signal.aborted).toBe(true);
         expect(captured.exitReason).toBe('exit_code_1');
-      } finally { clearTimeout(timer); }
+      } finally { abort.dispose(); }
     });
   });
   test('a timeout cannot be overwritten by a max-turn result line', async () => {
